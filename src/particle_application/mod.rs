@@ -1,14 +1,13 @@
+use std::mem::size_of;
+use std::ops::Mul;
 use rand::Rng;
 use std::sync::Arc;
-use vulkano::buffer::{BufferUsage, CpuAccessibleBuffer, DeviceLocalBuffer, TypedBufferAccess};
-use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBuffer, DynamicState};
+use vulkano::buffer::{BufferAccess, BufferUsage, CpuAccessibleBuffer, DeviceLocalBuffer, TypedBufferAccess};
+use vulkano::command_buffer::{AutoCommandBufferBuilder, CommandBufferUsage, DrawIndirectCommand, DynamicState, PrimaryCommandBuffer, SubpassContents};
 use vulkano::descriptor::descriptor_set::{FixedSizeDescriptorSetsPool, PersistentDescriptorSet};
 use vulkano::descriptor::PipelineLayoutAbstract;
 use vulkano::device::{Device, DeviceExtensions, Features, Queue};
-use vulkano::framebuffer::{
-    Framebuffer, FramebufferAbstract, RenderPass, RenderPassAbstract, Subpass,
-};
-use vulkano::image::SwapchainImage;
+use vulkano::image::{ImageAccess, SwapchainImage};
 use vulkano::instance::{Instance, PhysicalDevice};
 use vulkano::pipeline::viewport::Viewport;
 use vulkano::pipeline::{ComputePipeline, GraphicsPipeline};
@@ -16,12 +15,17 @@ use vulkano::swapchain::{
     self, AcquireError, ColorSpace, FullscreenExclusive, PresentMode, Surface, SurfaceTransform,
     Swapchain, SwapchainCreationError,
 };
-use vulkano::sync;
+use vulkano::{sync};
 use vulkano::sync::{FlushError, GpuFuture};
 use vulkano_win::VkSurfaceBuild;
 use winit::event_loop::{ControlFlow, EventLoop, EventLoopWindowTarget};
-use winit::monitor::MonitorHandle;
 use winit::window::{Fullscreen, Window, WindowBuilder};
+use rayon::prelude::*;
+use vulkano::format::FormatTy::Float;
+use vulkano::image::view::ImageView;
+use vulkano::render_pass::{Framebuffer, FramebufferAbstract, RenderPass, Subpass};
+use winit::dpi::Pixel;
+use log::debug;
 
 pub struct ParticleApplication;
 
@@ -69,7 +73,7 @@ fn init_vulkan() -> (Arc<Device>, Arc<Queue>, Arc<Instance>) {
             },
             [(queue_family, 0.5)].iter().cloned(),
         )
-        .expect("failed to create device")
+            .expect("failed to create device")
     };
 
     let queue = queues.next().unwrap();
@@ -90,38 +94,21 @@ pub fn vulkano_particles(device: Arc<Device>, queue: Arc<Queue>, instance: Arc<I
     let alpha = caps.supported_composite_alpha.iter().next().unwrap();
     let format = caps.supported_formats[0].0;
 
-    let (mut swapchain, images) = Swapchain::new(
-        device.clone(),
-        surface.clone(),
-        caps.min_image_count,
-        format,
-        dimensions,
-        1,
-        caps.supported_usage_flags,
-        &queue,
-        SurfaceTransform::Identity,
-        alpha,
-        PresentMode::Fifo,
-        FullscreenExclusive::Default,
-        true,
-        ColorSpace::SrgbNonLinear,
-    )
-    .expect("failed to create swapchain");
-
-    let mut particles = Vec::new();
-
-    const PARTICLE_COUNT: u32 = 1_048_576;
+    let (mut swapchain, images) = Swapchain::start(device.clone(),surface.clone())
+        .format(format)
+        .dimensions(dimensions)
+        .num_images(caps.min_image_count)
+        .usage(caps.supported_usage_flags)
+        .composite_alpha(alpha)
+        .build().unwrap();
 
     println!("Generating particles");
-    for _ in 1..PARTICLE_COUNT {
-        particles.push(Vertex::new(
-            rand::thread_rng().gen_range(-1.0, 1.0),
-            rand::thread_rng().gen_range(-1.0, 1.0),
-        ));
-    }
+    const PARTICLE_COUNT: u32 = 1_000_000;
+    let mut particles = vec![Vertex::new(0f32, 0f32); PARTICLE_COUNT as usize];
+    particles.par_iter_mut().for_each(|v| v.position = [rand::thread_rng().gen_range(-1.0..1.0), rand::thread_rng().gen_range(-1.0..1.0)]);
     println!("Done. Enjoy");
 
-    let cpu_buffer = CpuAccessibleBuffer::from_iter(
+    let cpu_vertex_buffer = CpuAccessibleBuffer::from_iter(
         device.clone(),
         BufferUsage {
             transfer_source: true,
@@ -130,11 +117,11 @@ pub fn vulkano_particles(device: Arc<Device>, queue: Arc<Queue>, instance: Arc<I
         false,
         particles.into_iter(),
     )
-    .unwrap();
+        .unwrap();
 
-    let vertex_buffer = DeviceLocalBuffer::array(
+    let vertex_buffer = DeviceLocalBuffer::<[Vertex]>::array(
         device.clone(),
-        cpu_buffer.len(),
+        cpu_vertex_buffer.len(),
         BufferUsage {
             transfer_destination: true,
             vertex_buffer: true,
@@ -143,19 +130,6 @@ pub fn vulkano_particles(device: Arc<Device>, queue: Arc<Queue>, instance: Arc<I
         },
         vec![queue.family()],
     )
-    .unwrap();
-
-    AutoCommandBufferBuilder::new(device.clone(), queue.family())
-        .unwrap()
-        .copy_buffer(cpu_buffer.clone(), vertex_buffer.clone())
-        .unwrap()
-        .build()
-        .unwrap()
-        .execute(queue.clone())
-        .unwrap()
-        .then_signal_fence_and_flush()
-        .unwrap()
-        .wait(None)
         .unwrap();
 
     let render_pass = Arc::new(
@@ -173,8 +147,100 @@ pub fn vulkano_particles(device: Arc<Device>, queue: Arc<Queue>, instance: Arc<I
                 depth_stencil: {}
             }
         )
-        .unwrap(),
+            .unwrap(),
     );
+
+    let draw_indirect_cmd_buffers = vec![unsafe {
+        DeviceLocalBuffer::<[DrawIndirectCommand]>::raw(
+            device.clone(),
+            16,
+            BufferUsage {
+                indirect_buffer: true,
+                storage_buffer: true,
+                ..BufferUsage::indirect_buffer()
+            },
+            vec![queue.family()],
+        )
+    }.unwrap(),
+                                         unsafe {
+        DeviceLocalBuffer::<[DrawIndirectCommand]>::raw(
+            device.clone(),
+            16,
+            BufferUsage {
+                indirect_buffer: true,
+                storage_buffer: true,
+                ..BufferUsage::indirect_buffer()
+            },
+            vec![queue.family()],
+        )
+    }.unwrap()];
+
+    let draw_output_buffers = vec![DeviceLocalBuffer::array(
+        device.clone(),
+        1920*1080, // should be fine up to 4k
+        BufferUsage {
+            vertex_buffer: true,
+            storage_buffer: true,
+            ..BufferUsage::none()
+        },
+        vec![queue.family()]
+    ).unwrap(),DeviceLocalBuffer::<[Vertex]>::array(
+        device.clone(),
+        1920*1080, // should be fine up to 4k
+        BufferUsage {
+            vertex_buffer: true,
+            storage_buffer: true,
+            ..BufferUsage::none()
+        },
+        vec![queue.family()]
+    ).unwrap()];
+    let mut current_update_buffer = 0;
+
+    let cpu_vertex_count_buffer = CpuAccessibleBuffer::from_data(
+        device.clone(),
+        BufferUsage {
+            transfer_source: true,
+            ..BufferUsage::none()
+        },
+        false,
+        [PARTICLE_COUNT]
+    ).unwrap();
+    let vertex_count_buffer = unsafe {
+        DeviceLocalBuffer::<[u32; 1]>::raw(
+            device.clone(),
+            4,
+            BufferUsage {
+                storage_buffer: true,
+                transfer_destination: true,
+                ..BufferUsage::none()
+            },
+            vec![queue.family()]
+        )
+    }.unwrap();
+    let draw_vertex_count_buffer = unsafe {
+        DeviceLocalBuffer::<Vec<u32>>::raw(
+            device.clone(),
+            4,
+            BufferUsage {
+                storage_buffer: true,
+                transfer_destination: true,
+                ..BufferUsage::none()
+            },
+            vec![queue.family()]
+        )
+    }.unwrap();
+
+    {
+        let mut command_buffer_builder = AutoCommandBufferBuilder::primary(device.clone(), queue.clone().family(), CommandBufferUsage::OneTimeSubmit).unwrap();
+        command_buffer_builder.copy_buffer(cpu_vertex_buffer.clone(), vertex_buffer.clone()).unwrap()
+            .copy_buffer(cpu_vertex_count_buffer.clone(), vertex_count_buffer.clone()).unwrap();
+
+        let command_buffer = command_buffer_builder.build().unwrap();
+
+        command_buffer.execute(queue.clone()).unwrap()
+            .then_signal_fence_and_flush().unwrap()
+            .wait(None).unwrap();
+    }
 
     let mut dynamic_state = DynamicState::none();
 
@@ -205,7 +271,7 @@ pub fn vulkano_particles(device: Arc<Device>, queue: Arc<Queue>, instance: Arc<I
         .expect("failed to load particle_shader");
 
     let particle_compute_pipeline = Arc::new(
-        ComputePipeline::new(device.clone(), &particle_shader.main_entry_point(), &())
+        ComputePipeline::new(device.clone(), &particle_shader.main_entry_point(), &(), None)
             .expect("failed to create particle_compute_pipeline"),
     );
 
@@ -226,6 +292,37 @@ pub fn vulkano_particles(device: Arc<Device>, queue: Arc<Queue>, instance: Arc<I
             .build()
             .unwrap(),
     );
+
+    let cull_shader = shaders::cs_cull::Shader::load(device.clone())
+        .expect("failed to load cull_shader");
+
+    let cull_compute_pipeline = Arc::new(
+        ComputePipeline::new(device.clone(), &cull_shader.main_entry_point(), &(), None)
+            .expect("failed to create cull_compute_pipeline"),
+    );
+
+    let cull_layout = cull_compute_pipeline
+        .layout()
+        .descriptor_set_layout(0)
+        .unwrap();
+
+    let cull_descriptor_sets = vec![Arc::new(
+        PersistentDescriptorSet::start(cull_layout.clone())
+            .add_buffer(vertex_buffer.clone()).unwrap()
+            .add_buffer(draw_output_buffers[0].clone()).unwrap()
+            .add_buffer(draw_indirect_cmd_buffers[0].clone()).unwrap()
+            .add_buffer(vertex_count_buffer.clone()).unwrap()
+            .add_buffer(draw_vertex_count_buffer.clone()).unwrap()
+            .build().unwrap()
+    ),Arc::new(
+        PersistentDescriptorSet::start(cull_layout.clone())
+            .add_buffer(vertex_buffer.clone()).unwrap()
+            .add_buffer(draw_output_buffers[1].clone()).unwrap()
+            .add_buffer(draw_indirect_cmd_buffers[1].clone()).unwrap()
+            .add_buffer(vertex_count_buffer.clone()).unwrap()
+            .add_buffer(draw_vertex_count_buffer.clone()).unwrap()
+            .build().unwrap()
+    )];
 
     let mut uniform_pool = FixedSizeDescriptorSetsPool::new(uniform_layout.clone());
 
@@ -282,6 +379,7 @@ pub fn vulkano_particles(device: Arc<Device>, queue: Arc<Queue>, instance: Arc<I
                                     surface
                                         .window()
                                         .primary_monitor()
+                                        .unwrap()
                                         .video_modes()
                                         .next()
                                         .unwrap(),
@@ -314,33 +412,42 @@ pub fn vulkano_particles(device: Arc<Device>, queue: Arc<Queue>, instance: Arc<I
                     false,
                     uniform_data,
                 )
-                .expect("failed to create particle_uniform_buffer");
+                    .expect("failed to create particle_uniform_buffer");
                 let uniform_set = uniform_pool
                     .next()
-                    .add_buffer(particle_uniform_buffer.clone())
-                    .unwrap()
-                    .build()
-                    .unwrap();
+                    .add_buffer(particle_uniform_buffer.clone()).unwrap()
+                    .build().unwrap();
 
-                let particle_cmd_buffer =
-                    AutoCommandBufferBuilder::new(device.clone(), queue.family())
-                        .unwrap()
+
+                let mut particle_cmd_buffer_builder =
+                    AutoCommandBufferBuilder::primary(device.clone(), queue.clone().family(), CommandBufferUsage::OneTimeSubmit).unwrap();
+                particle_cmd_buffer_builder
                         .dispatch(
                             [PARTICLE_COUNT / 1024, 1, 1],
                             particle_compute_pipeline.clone(),
                             (particle_set.clone(), uniform_set),
                             (),
-                        )
-                        .unwrap()
-                        .build()
-                        .unwrap();
+                            vec![]
+                        ).unwrap();
+                let particle_cmd_buffer = particle_cmd_buffer_builder.build().unwrap();
+                let particle_cmd_future = particle_cmd_buffer.execute(queue.clone()).unwrap()
+                    .then_signal_fence_and_flush().unwrap();
 
-                let particle_cmd_finished = particle_cmd_buffer.execute(queue.clone()).unwrap();
-                particle_cmd_finished
-                    .then_signal_fence_and_flush()
-                    .unwrap()
-                    .wait(None)
-                    .unwrap();
+                let mut cull_cmd_buffer_builder =
+                    AutoCommandBufferBuilder::primary(device.clone(), queue.clone().family(), CommandBufferUsage::OneTimeSubmit).unwrap();
+                cull_cmd_buffer_builder
+                        .dispatch(
+                            [PARTICLE_COUNT / 1024, 1, 1],
+                            cull_compute_pipeline.clone(),
+                            cull_descriptor_sets[current_update_buffer].clone(),
+                            vec![aspect],
+                            vec![]
+                        ).unwrap();
+                let cull_cmd_buffer = cull_cmd_buffer_builder.build().unwrap();
+                let cull_cmd_future = cull_cmd_buffer.execute_after(particle_cmd_future, queue.clone()).unwrap();
+                cull_cmd_future
+                    .then_signal_fence_and_flush().unwrap()
+                    .wait(None).unwrap();
 
                 surface
                     .window()
@@ -389,47 +496,44 @@ pub fn vulkano_particles(device: Arc<Device>, queue: Arc<Queue>, instance: Arc<I
                     false,
                     VertexUBO { aspect },
                 )
-                .unwrap();
+                    .unwrap();
 
                 let vertex_uniform_set = vertex_uniform_pool
                     .next()
-                    .add_buffer(vertex_uniform_buffer.clone())
-                    .unwrap()
-                    .build()
-                    .unwrap();
+                    .add_buffer(vertex_uniform_buffer.clone()).unwrap()
+                    .build().unwrap();
 
-                let command_buffer = AutoCommandBufferBuilder::primary_one_time_submit(
+                let mut draw_command_buffer_builder = AutoCommandBufferBuilder::primary(
                     device.clone(),
                     queue.family(),
-                )
-                .unwrap()
-                .begin_render_pass(
-                    framebuffers[image_num].clone(),
-                    false,
-                    vec![[0.0, 0.0, 0.0, 1.0].into()],
-                )
-                .unwrap()
-                .draw(
-                    pipeline.clone(),
-                    &dynamic_state,
-                    vertex_buffer.clone(),
-                    vertex_uniform_set,
-                    (),
-                )
-                .unwrap()
-                .end_render_pass()
-                .unwrap()
-                .build()
-                .unwrap();
+                    CommandBufferUsage::OneTimeSubmit
+                ).unwrap();
+                draw_command_buffer_builder
+                    .begin_render_pass(
+                        framebuffers[image_num].clone(),
+                        SubpassContents::Inline,
+                        vec![[0.0, 0.0, 0.0, 1.0].into()],
+                    ).unwrap()
+                    .draw_indirect(
+                        pipeline.clone(),
+                        &dynamic_state,
+                        draw_output_buffers[current_update_buffer].clone(),
+                        draw_indirect_cmd_buffers[current_update_buffer].clone(),
+                        vertex_uniform_set,
+                        (),
+                        vec![]
+                    ).unwrap()
+                    .end_render_pass().unwrap();
+                let draw_command_buffer = draw_command_buffer_builder.build().unwrap();
 
                 let future = previous_frame_end
-                    .take()
-                    .unwrap()
+                    .take().unwrap()
                     .join(acquire_future)
-                    .then_execute(queue.clone(), command_buffer)
-                    .unwrap()
+                    .then_execute(queue.clone(), draw_command_buffer).unwrap()
                     .then_swapchain_present(queue.clone(), swapchain.clone(), image_num)
                     .then_signal_fence_and_flush();
+
+                current_update_buffer = (current_update_buffer + 1) % 2;
 
                 match future {
                     Ok(future) => {
@@ -468,7 +572,7 @@ fn build_window(
 
 fn recreate_swap_chain(
     surface: &Surface<Window>,
-    render_pass: Arc<dyn RenderPassAbstract + Send + Sync>,
+    render_pass: Arc<RenderPass>,
     swapchain: Arc<Swapchain<Window>>,
     dynamic_state: &mut DynamicState,
     aspect: &mut f32,
@@ -485,7 +589,7 @@ fn recreate_swap_chain(
 
     println!("New aspect ratio {}", aspect);
 
-    let (new_swapchain, new_images) = match swapchain.recreate_with_dimensions(dimensions) {
+    let (new_swapchain, new_images) = match swapchain.recreate().dimensions(dimensions).build() {
         Ok(r) => r,
         Err(e) => return Err(e),
     };
@@ -497,15 +601,15 @@ fn recreate_swap_chain(
 }
 
 fn window_size_dependent_setup(
-    images: &[Arc<SwapchainImage<Window>>],
-    render_pass: Arc<dyn RenderPassAbstract + Send + Sync>,
+    images: &Vec<Arc<SwapchainImage<Window>>>,
+    render_pass: Arc<RenderPass>,
     dynamic_state: &mut DynamicState,
 ) -> Vec<Arc<dyn FramebufferAbstract + Send + Sync>> {
     let dimensions = images[0].dimensions();
 
     let viewport = Viewport {
         origin: [0.0, 0.0],
-        dimensions: [dimensions[0] as f32, dimensions[1] as f32],
+        dimensions: dimensions.width_height().map(f64::from).map(f32::from_f64),
         depth_range: 0.0..1.0,
     };
 
@@ -516,10 +620,8 @@ fn window_size_dependent_setup(
         .map(|image| {
             Arc::new(
                 Framebuffer::start(render_pass.clone())
-                    .add(image.clone())
-                    .unwrap()
-                    .build()
-                    .unwrap(),
+                    .add(ImageView::new(image.clone()).unwrap()).unwrap()
+                    .build().unwrap(),
             ) as Arc<dyn FramebufferAbstract + Send + Sync>
         })
         .collect::<Vec<_>>()
@@ -541,12 +643,14 @@ impl Vertex {
 }
 vulkano::impl_vertex!(Vertex, position, velocity);
 
+#[derive(Copy, Clone)]
 struct ParticleUBO {
     target: [f32; 2],
     delta_time: f32,
     target_mass: f32,
 }
 
+#[derive(Copy, Clone)]
 struct VertexUBO {
     aspect: f32,
 }

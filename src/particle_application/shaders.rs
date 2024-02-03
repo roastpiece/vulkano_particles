@@ -18,3 +18,11 @@ pub mod cs_particle_physics {
         path: "shaders/particle_physics.comp.glsl"
     }
 }
+
+pub mod cs_cull {
+    vulkano_shaders::shader! {
+        ty: "compute",
+        path: "shaders/particle_cull.comp.glsl"
+    }
+}
+
